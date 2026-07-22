@@ -1,167 +1,133 @@
-import { useEffect, useState } from 'react';
-import Navbar from '../components/Navbar';
-import { useAuth } from '../context/AuthContext';
-import { api } from '../lib/api';
+const express = require('express');
+const { pool } = require('../db');
+const { authMiddleware } = require('../middleware/auth');
 
-export default function Tokens() {
-  const { user, loading, balance, refreshBalance } = useAuth();
-  const [packages, setPackages] = useState([]);
-  const [transactions, setTransactions] = useState([]);
-  const [payoutInfo, setPayoutInfo] = useState(null);
-  const [payoutForm, setPayoutForm] = useState({ tokens: '', method: '', details: '' });
-  const [message, setMessage] = useState('');
-  const [payoutMsg, setPayoutMsg] = useState('');
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
+const router = express.Router();
 
-  useEffect(() => {
-    api.getTokenPackages().then(setPackages).catch(() => {});
-    if (user) {
-      api.getTransactions().then(setTransactions).catch(() => {});
-      api.getPayoutInfo().then(setPayoutInfo).catch(() => {});
-    }
-  }, [user]);
+// Pacchetti token — commissione 0% per i creator
+const TOKEN_PACKAGES = [
+  { id: 'pkg_100', tokens: 100, price_eur: 4.99 },
+  { id: 'pkg_250', tokens: 250, price_eur: 9.99 },
+  { id: 'pkg_600', tokens: 600, price_eur: 19.99 },
+  { id: 'pkg_1500', tokens: 1500, price_eur: 44.99 }
+];
 
-  if (loading) return null;
+const TOKEN_TO_EUR = 0.03; // 1 token = €0.03
+const MIN_PAYOUT = 500;    // minimo 500 token per richiedere payout
 
-  if (!user) {
-    return (
-      <div><Navbar />
-        <div className="container"><p>Accedi per gestire i tuoi token.</p></div>
-      </div>
+router.get('/packages', (req, res) => {
+  res.json(TOKEN_PACKAGES);
+});
+
+router.get('/balance', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT token_balance FROM users WHERE id = $1', [req.user.id]);
+    res.json({ balance: result.rows[0].token_balance });
+  } catch (err) {
+    res.status(500).json({ error: 'Errore interno' });
+  }
+});
+
+router.get('/transactions', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT t.id, t.type, t.amount, t.description, t.created_at,
+             u.username AS related_username
+      FROM token_transactions t
+      LEFT JOIN users u ON u.id = t.related_user_id
+      WHERE t.user_id = $1
+      ORDER BY t.created_at DESC LIMIT 100
+    `, [req.user.id]);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Errore interno' });
+  }
+});
+
+// Acquisto simulato (da sostituire con Stripe in produzione)
+router.post('/purchase-mock', authMiddleware, async (req, res) => {
+  const { packageId } = req.body;
+  const pkg = TOKEN_PACKAGES.find(p => p.id === packageId);
+  if (!pkg) return res.status(400).json({ error: 'Pacchetto non valido' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('UPDATE users SET token_balance = token_balance + $1 WHERE id = $2', [pkg.tokens, req.user.id]);
+    await client.query(
+      `INSERT INTO token_transactions (user_id, type, amount, description) VALUES ($1, 'purchase', $2, $3)`,
+      [req.user.id, pkg.tokens, `Acquisto ${pkg.tokens} token (simulato)`]
     );
+    await client.query('COMMIT');
+    const updated = await pool.query('SELECT token_balance FROM users WHERE id = $1', [req.user.id]);
+    res.json({ success: true, balance: updated.rows[0].token_balance, added: pkg.tokens });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'Errore interno' });
+  } finally {
+    client.release();
+  }
+});
+
+// Info payout
+router.get('/payout-info', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT token_balance FROM users WHERE id = $1', [req.user.id]);
+    res.json({
+      balance: result.rows[0].token_balance,
+      rate: TOKEN_TO_EUR,
+      minTokens: MIN_PAYOUT,
+      minEur: (MIN_PAYOUT * TOKEN_TO_EUR).toFixed(2),
+      commission: '0%',
+      note: 'Nessuna commissione — ricevi il 100% del valore dei token.'
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Errore interno' });
+  }
+});
+
+// Richiesta payout
+router.post('/payout', authMiddleware, async (req, res) => {
+  const { tokens, payoutMethod, payoutDetails } = req.body;
+  const tokensRequested = Number(tokens);
+
+  if (!Number.isInteger(tokensRequested) || tokensRequested < MIN_PAYOUT) {
+    return res.status(400).json({ error: `Minimo ${MIN_PAYOUT} token per il payout` });
+  }
+  if (!payoutMethod || !payoutDetails) {
+    return res.status(400).json({ error: 'Metodo e dati di pagamento obbligatori' });
   }
 
-  async function handlePurchase(pkg) {
-    setBusy(true);
-    setError('');
-    setMessage('');
-    try {
-      const res = await api.purchaseMock(pkg.id);
-      refreshBalance();
-      setMessage(`+${res.added} token aggiunti al tuo saldo! (simulato)`);
-      const tx = await api.getTransactions();
-      setTransactions(tx);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setBusy(false);
+  const client = await pool.connect();
+  try {
+    const userResult = await client.query('SELECT token_balance FROM users WHERE id = $1', [req.user.id]);
+    if (userResult.rows[0].token_balance < tokensRequested) {
+      return res.status(400).json({ error: 'Saldo insufficiente' });
     }
+
+    const amountEur = (tokensRequested * TOKEN_TO_EUR).toFixed(2);
+
+    await client.query('BEGIN');
+    await client.query('UPDATE users SET token_balance = token_balance - $1 WHERE id = $2', [tokensRequested, req.user.id]);
+    await client.query(
+      `INSERT INTO token_transactions (user_id, type, amount, description) VALUES ($1, 'payout_requested', $2, $3)`,
+      [req.user.id, -tokensRequested, `Richiesta payout ${tokensRequested} token (€${amountEur})`]
+    );
+    const payoutResult = await client.query(
+      `INSERT INTO payout_requests (user_id, tokens_requested, amount_eur, payout_method, payout_details)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [req.user.id, tokensRequested, amountEur, payoutMethod, payoutDetails]
+    );
+    await client.query('COMMIT');
+
+    const updated = await pool.query('SELECT token_balance FROM users WHERE id = $1', [req.user.id]);
+    res.status(201).json({ id: payoutResult.rows[0].id, amount_eur: amountEur, newBalance: updated.rows[0].token_balance });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'Errore interno' });
+  } finally {
+    client.release();
   }
+});
 
-  async function handlePayout(e) {
-    e.preventDefault();
-    setBusy(true);
-    setPayoutMsg('');
-    try {
-      const res = await api.requestPayout({
-        tokens: Number(payoutForm.tokens),
-        payoutMethod: payoutForm.method,
-        payoutDetails: payoutForm.details
-      });
-      setPayoutMsg(`Richiesta inviata! Riceverai €${res.amount_eur}. Saldo rimanente: ${res.newBalance} token.`);
-      setPayoutForm({ tokens: '', method: '', details: '' });
-      refreshBalance();
-      const tx = await api.getTransactions();
-      setTransactions(tx);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div>
-      <Navbar />
-      <div className="container">
-        <h1>I tuoi token</h1>
-        <p style={{ fontSize: 18, margin: '0 0 1.5rem' }}>
-          Saldo: <strong style={{ color: '#ffd54f' }}>🪙 {balance} token</strong>
-        </p>
-
-        {error && <p className="error-text">{error}</p>}
-        {message && <p style={{ color: '#4caf50' }}>{message}</p>}
-
-        <h2>Acquista token</h2>
-        <p style={{ fontSize: 13, color: '#888', marginBottom: '1rem' }}>
-          ⚠️ Acquisto simulato — nessun pagamento reale. Integra Stripe per i pagamenti reali.
-        </p>
-        <div className="grid">
-          {packages.map(pkg => (
-            <div key={pkg.id} className="card" style={{ textAlign: 'center' }}>
-              <p style={{ fontSize: 28, fontWeight: 600, color: '#ffd54f', margin: '0 0 4px' }}>🪙 {pkg.tokens}</p>
-              <p style={{ color: '#888', margin: '0 0 12px' }}>€{pkg.price_eur.toFixed(2)}</p>
-              <button disabled={busy} onClick={() => handlePurchase(pkg)}>
-                {busy ? '...' : 'Acquista'}
-              </button>
-            </div>
-          ))}
-        </div>
-
-        {payoutInfo && (
-          <>
-            <h2 style={{ marginTop: '2rem' }}>Richiedi payout</h2>
-            <div className="card" style={{ marginBottom: '1rem' }}>
-              <p style={{ color: '#4caf50', fontSize: 13 }}>✅ {payoutInfo.note}</p>
-              <p style={{ fontSize: 13, color: '#888' }}>
-                Tasso: 1 token = €{payoutInfo.rate} — Minimo: {payoutInfo.minTokens} token (€{payoutInfo.minEur})
-              </p>
-            </div>
-            <form onSubmit={handlePayout} style={{ maxWidth: 400 }}>
-              <input
-                type="number"
-                placeholder={`Token da convertire (min ${payoutInfo.minTokens})`}
-                value={payoutForm.tokens}
-                onChange={e => setPayoutForm(p => ({ ...p, tokens: e.target.value }))}
-                required
-              />
-              {payoutForm.tokens && (
-                <p style={{ fontSize: 13, color: '#ffd54f', margin: '2px 0 8px' }}>
-                  = €{(Number(payoutForm.tokens) * payoutInfo.rate).toFixed(2)}
-                </p>
-              )}
-              <select
-                value={payoutForm.method}
-                onChange={e => setPayoutForm(p => ({ ...p, method: e.target.value }))}
-                required
-                style={{ width: '100%', padding: '0.6rem', background: '#0f0f12', border: '1px solid #333', borderRadius: 4, color: '#fff', margin: '4px 0' }}
-              >
-                <option value="">Metodo di pagamento...</option>
-                <option value="bank_transfer">Bonifico bancario</option>
-                <option value="paypal">PayPal</option>
-                <option value="crypto">Criptovaluta</option>
-              </select>
-              <input
-                placeholder="Dettagli (IBAN, email PayPal, wallet...)"
-                value={payoutForm.details}
-                onChange={e => setPayoutForm(p => ({ ...p, details: e.target.value }))}
-                required
-              />
-              {payoutMsg && <p style={{ color: '#4caf50', fontSize: 13 }}>{payoutMsg}</p>}
-              <button type="submit" disabled={busy}>Richiedi payout</button>
-            </form>
-          </>
-        )}
-
-        <h2 style={{ marginTop: '2rem' }}>Storico transazioni</h2>
-        {transactions.length === 0 && <p style={{ color: '#666' }}>Nessuna transazione ancora.</p>}
-        <div style={{ overflowX: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
-            <tbody>
-              {transactions.map(t => (
-                <tr key={t.id} style={{ borderBottom: '1px solid #1a1a1f' }}>
-                  <td style={{ padding: '8px', color: '#666' }}>{new Date(t.created_at).toLocaleDateString()}</td>
-                  <td style={{ padding: '8px' }}>{t.description}</td>
-                  <td style={{ padding: '8px', textAlign: 'right', color: t.amount >= 0 ? '#4caf50' : '#ff6b6b', fontWeight: 500 }}>
-                    {t.amount >= 0 ? '+' : ''}{t.amount} 🪙
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  );
-}
+module.exports = router;
